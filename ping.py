@@ -67,6 +67,9 @@ import select
 import random
 import asyncore
 
+# added by swgu
+import numpy
+
 # From /usr/include/linux/icmp.h; your milage may vary.
 ICMP_ECHO_REQUEST = 8 # Seems to be the same on Solaris.
 
@@ -178,7 +181,7 @@ def receive_ping(my_socket, packet_id, time_sent, timeout):
             return
 
 
-def verbose_ping(dest_addr, timeout=2, count=10):
+def verbose_ping(dest_addr, timeout=2, count=100):
     """
     Sends one ping to the given "dest_addr" which can be an ip or hostname.
     "timeout" can be any integer or float except negatives and zero.
@@ -186,14 +189,35 @@ def verbose_ping(dest_addr, timeout=2, count=10):
     Displays the result on the screen.
  
     """
+    delay_array = []   # added by swgu
+    
     for i in range(count):
-        print('ping {}...'.format(dest_addr))
+        # print('ping {}...'.format(dest_addr))
         delay = do_one(dest_addr, timeout)
         if delay == None:
             print('failed. (Timeout within {} seconds.)'.format(timeout))
         else:
             delay = round(delay * 1000.0, 4)
-            print('get ping in {} milliseconds.'.format(delay))
+            # print('get ping in {} milliseconds.'.format(delay))
+            delay_array.append(delay)  # added by swgu
+    
+    print('mean: ', numpy.mean(delay_array))
+    print('var: ', numpy.var(delay_array))
+    print('std: ', numpy.std(delay_array))
+    print('min: ', numpy.min(delay_array))
+    print('max: ', numpy.max(delay_array))
+    
+    filename = 'ping'+str(count)
+    print('filename: ', filename)
+    with open(filename, 'w') as f:
+        f.write('\n'.join(str(item) for item in delay_array))
+    f.close()
+    
+    
+           
+    # print('ping mean: ', statistics.mean(delay_array)) # added by swgu
+    # print('ping standard deviation: ', statistics,stdev(delay_array))
+            
     print('')
 
 
@@ -342,9 +366,14 @@ if __name__ == '__main__':
 #    verbose_ping('an-invalid-test-url.com')
 #    verbose_ping('127.0.0.1')
 #    host_list = ['www.heise.de', 'google.com', '127.0.0.1', 'an-invalid-test-url.com']
+    timeout = input("Please input timeout to wait for ping response (unit: ms) : ")
+    count = input("Please input the number of count to ping : ")
 
-    verbose_ping('34.159.104.220')
-    verbose_ping('34.159.134.245')
-    host_list = ['34.159.104.220', '34.159.134.245']
-    for host, ping in multi_ping_query(host_list).iteritems():
-        print(host, '=', ping)
+    verbose_ping('34.159.104.220', timeout, count)
+    # verbose_ping('34.159.134.245', timeout, count)
+    
+    
+    # host_list = ['34.159.104.220', '34.159.134.245']
+    # for host, ping in multi_ping_query(host_list).iteritems():
+    #     print(host, '=', ping)
+
