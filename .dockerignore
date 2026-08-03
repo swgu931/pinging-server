@@ -1,0 +1,38 @@
+# Keep the build context small and free of secrets / generated files.
+.git
+.gitignore
+.dockerignore
+Dockerfile
+docker_readme.md
+README.md
+CHANGELOG.md
+
+# Secrets / personal
+.env
+.env.*
+secrets
+.gitconfig
+.bashrc
+.bash_profile
+.profile
+.zshrc
+.zprofile
+.ripgreprc
+
+# Tooling / IDE
+.claude/
+.idea/
+.vscode/
+.mcp.json
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Generated outputs
+ping*.csv
+*_timeseries.png
+*_dist.png
+ping[0-9]*
+!ping3.py
