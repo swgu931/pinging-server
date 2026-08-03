@@ -1,0 +1,41 @@
+# --- Secrets / credentials (never commit) ---
+.env
+.env.*
+secrets
+*.pem
+*.key
+credentials
+
+# --- Leaked home / shell dotfiles (should not live in the repo) ---
+.bashrc
+.bash_profile
+.profile
+.zshrc
+.zprofile
+.gitconfig
+.ripgreprc
+
+# --- Editor / IDE / tooling ---
+.idea/
+.vscode/
+.claude/
+.mcp.json
+
+# --- Python artifacts ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# --- Generated ping outputs (derived; regenerable) ---
+# CSV measurement logs and rendered plots. Remove these lines if you want to
+# version your experiment data for the paper.
+ping*.csv
+*_timeseries.png
+*_dist.png
+# legacy plain-number output files (ping<count> with no extension)
+ping[0-9]*
+!ping3.py

@@ -1,6 +1,6 @@
 
 """
-#! /usr/bin/env python2
+#!/usr/bin/env python3
 
     Other Repositories of python-ping
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -60,18 +60,39 @@
     unsigned. My thanks to Jerome Poincheval for the fix.
 """
 
+import os
+import csv
 import time
 import socket
 import struct
 import select
 import random
-import asyncore
+import datetime
+
+# asyncore was removed in Python 3.12. It is only needed by the (optional)
+# PingQuery / multi_ping_query helpers, so import it lazily and keep the rest
+# of the module usable when it is unavailable.
+try:
+    import asyncore
+except ImportError:
+    asyncore = None
 
 # added by swgu
 import numpy
 
 # From /usr/include/linux/icmp.h; your milage may vary.
 ICMP_ECHO_REQUEST = 8 # Seems to be the same on Solaris.
+ICMP_ECHO_REPLY = 0
+
+# ICMP header: type(1) code(1) checksum(2) id(2) sequence(2) = 8 bytes.
+ICMP_HEADER_FORMAT = 'bbHHH'
+ICMP_HEADER_SIZE = struct.calcsize(ICMP_HEADER_FORMAT)  # 8
+# The payload starts with a high-resolution send timestamp (time.perf_counter,
+# a C double). The reply echoes the payload back unchanged, so the round-trip
+# time is derived from the reply itself and is immune to mismatched replies.
+ICMP_TIMESTAMP_FORMAT = 'd'
+ICMP_TIMESTAMP_SIZE = struct.calcsize(ICMP_TIMESTAMP_FORMAT)  # 8
+ICMP_PAYLOAD_SIZE = 192  # historical data-field size
 
 ICMP_CODE = socket.getprotobyname('icmp')
 ERROR_DESCR = {
@@ -89,21 +110,16 @@ def checksum(source_string):
     # I'm not too confident that this is right but testing seems to
     # suggest that it gives the same answers as in_cksum in ping.c.
     sum = 0
-    count_to = (len(source_string) / 2) * 2
+    count_to = (len(source_string) // 2) * 2
     count = 0
     while count < count_to:
-        """
-        print('source_string:', source_string)
-        print('count_to:', count_to)
-        print('---', source_string[count + 1])
-        print('===', source_string[count])
-        """
-        this_val = ord(source_string[count + 1])*256+ord(source_string[count])
+        # source_string is a bytes object, so indexing already yields ints.
+        this_val = source_string[count + 1] * 256 + source_string[count]
         sum = sum + this_val
         sum = sum & 0xffffffff # Necessary?
         count = count + 2
     if count_to < len(source_string):
-        sum = sum + ord(source_string[len(source_string) - 1])
+        sum = sum + source_string[len(source_string) - 1]
         sum = sum & 0xffffffff # Necessary?
     sum = (sum >> 16) + (sum & 0xffff)
     sum = sum + (sum >> 16)
@@ -114,18 +130,110 @@ def checksum(source_string):
     return answer
 
 
-def create_packet(id):
-    """Create a new echo request packet based on the given "id"."""
+def create_packet(packet_id, sequence=1, timestamp=None):
+    """Create an ICMP echo request packet.
+
+    "packet_id" and "sequence" identify the request so its reply can be told
+    apart from other traffic. "timestamp" (a time.perf_counter reading, in
+    seconds) is embedded at the start of the payload so the receiver can
+    compute the round-trip time from the reply; it defaults to "now".
+    """
+    if timestamp is None:
+        timestamp = time.perf_counter()
     # Header is type (8), code (8), checksum (16), id (16), sequence (16)
-    header = struct.pack('bbHHh', ICMP_ECHO_REQUEST, 0, 0, id, 1)
-    data = 192 * 'Q'
+    header = struct.pack(ICMP_HEADER_FORMAT, ICMP_ECHO_REQUEST, 0, 0,
+                         packet_id, sequence)
+    payload = struct.pack(ICMP_TIMESTAMP_FORMAT, timestamp)
+    payload += (ICMP_PAYLOAD_SIZE - len(payload)) * b'Q'
     # Calculate the checksum on the data and the dummy header.
-    my_checksum = checksum(header + data) 
+    my_checksum = checksum(header + payload)
     # Now that we have the right checksum, we put that in. It's just easier
     # to make up a new header than to stuff it into the dummy.
-    header = struct.pack('bbHHh', ICMP_ECHO_REQUEST, 0,
-                         socket.htons(my_checksum), id, 1)
-    return header + data
+    header = struct.pack(ICMP_HEADER_FORMAT, ICMP_ECHO_REQUEST, 0,
+                         socket.htons(my_checksum), packet_id, sequence)
+    return header + payload
+
+
+def new_icmp_socket():
+    """
+    Return a tuple "(socket, is_raw)" for sending ICMP echo requests.
+
+    Prefers an unprivileged datagram socket (SOCK_DGRAM), which needs no root
+    as long as the caller's gid is within /proc/sys/net/ipv4/ping_group_range.
+    Falls back to a raw socket (SOCK_RAW), which requires root.
+    "is_raw" tells the receiver how to parse replies (see "receive_ping").
+    """
+    try:
+        return socket.socket(socket.AF_INET, socket.SOCK_DGRAM, ICMP_CODE), False
+    except socket.error:
+        # Unprivileged ICMP not available; fall back to a raw socket.
+        my_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, ICMP_CODE)
+        return my_socket, True
+
+
+def ping_once(my_socket, is_raw, dest_ip, packet_id, sequence, timeout):
+    """
+    Send one echo request on the already-open "my_socket" and wait for its
+    matching reply. Returns the round-trip time in seconds, or None on timeout.
+    """
+    # Stamp the send time as late as possible, then build+send immediately.
+    send_time = time.perf_counter()
+    packet = create_packet(packet_id, sequence, send_time)
+    try:
+        while packet:
+            # The icmp protocol does not use a port, but sendto expects one,
+            # so we just give it a dummy port.
+            sent = my_socket.sendto(packet, (dest_ip, 1))
+            packet = packet[sent:]
+    except socket.error:
+        return None
+    return receive_ping(my_socket, is_raw, packet_id, sequence, timeout)
+
+
+def receive_ping(my_socket, is_raw, packet_id, sequence, timeout):
+    """
+    Wait up to "timeout" seconds for the echo reply matching this request and
+    return its round-trip time in seconds, or None on timeout.
+
+    Matching is strict: the reply must be an echo reply carrying the expected
+    sequence number (and, for a raw socket, the expected id). A raw socket
+    delivers the full IP packet, so the ICMP header starts at byte 20 and every
+    icmp reply on the host is seen (hence the id check). A datagram socket
+    delivers just the ICMP message (offset 0) and the kernel routes only our
+    replies to us, but it rewrites the id, so we rely on the sequence number.
+
+    The round-trip time is computed from the send timestamp echoed back in the
+    payload, so a delayed, duplicated or foreign reply can never corrupt a
+    measurement.
+    """
+    offset = 20 if is_raw else 0
+    ts_start = offset + ICMP_HEADER_SIZE
+    time_left = timeout
+    while time_left > 0:
+        started = time.perf_counter()
+        ready = select.select([my_socket], [], [], time_left)
+        if not ready[0]:  # timeout
+            return None
+        recv_time = time.perf_counter()
+        try:
+            rec_packet, addr = my_socket.recvfrom(1024)
+        except socket.error:
+            time_left -= time.perf_counter() - started
+            continue
+        time_left -= time.perf_counter() - started
+        if len(rec_packet) < ts_start + ICMP_TIMESTAMP_SIZE:
+            continue  # too short to be one of our replies
+        r_type, r_code, r_cksum, r_id, r_seq = struct.unpack(
+            ICMP_HEADER_FORMAT, rec_packet[offset:offset + ICMP_HEADER_SIZE])
+        if r_type != ICMP_ECHO_REPLY or r_seq != sequence:
+            continue  # not the reply we are waiting for
+        if is_raw and r_id != packet_id:
+            continue  # some other ping running on this host
+        (sent_time,) = struct.unpack(
+            ICMP_TIMESTAMP_FORMAT,
+            rec_packet[ts_start:ts_start + ICMP_TIMESTAMP_SIZE])
+        return recv_time - sent_time
+    return None
 
 
 def do_one(dest_addr, timeout=1):
@@ -136,92 +244,110 @@ def do_one(dest_addr, timeout=1):
     address, respectively.
     """
     try:
-        my_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, ICMP_CODE)
+        my_socket, is_raw = new_icmp_socket()
     except socket.error as e:
         if e.errno in ERROR_DESCR:
             # Operation not permitted
             raise socket.error(''.join((e.args[1], ERROR_DESCR[e.errno])))
         raise # raise the original error
     try:
-        host = socket.gethostbyname(dest_addr)
+        dest_ip = socket.gethostbyname(dest_addr)
     except socket.gaierror:
+        my_socket.close()
+        return None
+    # The id fits an unsigned short and identifies our replies on a raw socket.
+    packet_id = os.getpid() & 0xFFFF
+    try:
+        return ping_once(my_socket, is_raw, dest_ip, packet_id, 1, timeout)
+    finally:
+        my_socket.close()
+
+
+def verbose_ping(dest_addr, timeout=2, count=100, interval=0):
+    """
+    Pings "dest_addr" (ip or hostname) "count" times over a single reused
+    socket and prints summary statistics (in milliseconds) of the successful
+    replies. Also writes a per-ping CSV log to "ping<count>.csv" with columns
+    "seq,timestamp,rtt_ms" (rtt_ms is left blank on timeout), so the run can be
+    analysed as a time series.
+
+    "timeout"  per-ping wait, in seconds.
+    "count"    number of echo requests to send.
+    "interval" optional pause between successive pings, in seconds
+               (0 = back-to-back).
+    """
+    delay_array = []   # per-ping round-trip times in milliseconds (added by swgu)
+    rows = []          # (seq, iso_timestamp, rtt_ms_or_None) for the CSV log
+
+    try:
+        my_socket, is_raw = new_icmp_socket()
+    except socket.error as e:
+        if e.errno in ERROR_DESCR:
+            # Operation not permitted
+            raise socket.error(''.join((e.args[1], ERROR_DESCR[e.errno])))
+        raise # raise the original error
+    try:
+        dest_ip = socket.gethostbyname(dest_addr)
+    except socket.gaierror:
+        my_socket.close()
+        print('failed. (cannot resolve {})'.format(dest_addr))
         return
-    # Maximum for an unsigned short int c object counts to 65535 so
-    # we have to sure that our packet id is not greater than that.
-    packet_id = int((id(timeout) * random.random()) % 65535)
-    packet = create_packet(packet_id)
-    while packet:
-        # The icmp protocol does not use a port, but the function
-        # below expects it, so we just give it a dummy port.
-        sent = my_socket.sendto(packet, (dest_addr, 1))
-        packet = packet[sent:]
-    delay = receive_ping(my_socket, packet_id, time.time(), timeout)
-    my_socket.close()
-    return delay
 
+    # One id for the whole run; the sequence number identifies each request.
+    packet_id = os.getpid() & 0xFFFF
+    try:
+        for sequence in range(count):
+            # Wall-clock send time for the time-series log (RTT itself is still
+            # measured with the monotonic clock inside ping_once).
+            sent_at = datetime.datetime.now().isoformat(timespec='microseconds')
+            delay = ping_once(my_socket, is_raw, dest_ip, packet_id,
+                              sequence & 0xFFFF, timeout)
+            if delay is None:
+                print('failed. (Timeout within {} seconds.)'.format(timeout))
+                rows.append((sequence, sent_at, None))
+            else:
+                rtt_ms = round(delay * 1000.0, 4)
+                delay_array.append(rtt_ms)
+                rows.append((sequence, sent_at, rtt_ms))
+            if interval:
+                time.sleep(interval)
+    finally:
+        my_socket.close()
 
-def receive_ping(my_socket, packet_id, time_sent, timeout):
-    # Receive the ping from the socket.
-    time_left = timeout
-    while True:
-        started_select = time.time()
-        ready = select.select([my_socket], [], [], time_left)
-        how_long_in_select = time.time() - started_select
-        if ready[0] == []: # Timeout
-            return
-        time_received = time.time()
-        rec_packet, addr = my_socket.recvfrom(1024)
-        icmp_header = rec_packet[20:28]
-        type, code, checksum, p_id, sequence = struct.unpack(
-            'bbHHh', icmp_header)
-        if p_id == packet_id:
-            return time_received - time_sent
-        time_left -= time_received - time_sent
-        if time_left <= 0:
-            return
+    if delay_array:
+        print('mean: ', numpy.mean(delay_array))
+        print('var: ', numpy.var(delay_array))
+        print('std: ', numpy.std(delay_array))
+        print('min: ', numpy.min(delay_array))
+        print('max: ', numpy.max(delay_array))
+    else:
+        print('No responses received; no statistics to report.')
 
-
-def verbose_ping(dest_addr, timeout=2, count=100):
-    """
-    Sends one ping to the given "dest_addr" which can be an ip or hostname.
-    "timeout" can be any integer or float except negatives and zero.
-    "count" specifies how many pings will be sent.
-    Displays the result on the screen.
- 
-    """
-    delay_array = []   # added by swgu
-    
-    for i in range(count):
-        # print('ping {}...'.format(dest_addr))
-        delay = do_one(dest_addr, timeout)
-        if delay == None:
-            print('failed. (Timeout within {} seconds.)'.format(timeout))
-        else:
-            delay = round(delay * 1000.0, 4)
-            # print('get ping in {} milliseconds.'.format(delay))
-            delay_array.append(delay)  # added by swgu
-    
-    print('mean: ', numpy.mean(delay_array))
-    print('var: ', numpy.var(delay_array))
-    print('std: ', numpy.std(delay_array))
-    print('min: ', numpy.min(delay_array))
-    print('max: ', numpy.max(delay_array))
-    
-    filename = 'ping'+str(count)
+    filename = 'ping' + str(count) + '.csv'
     print('filename: ', filename)
-    with open(filename, 'w') as f:
-        f.write('\n'.join(str(item) for item in delay_array))
-    f.close()
-    
-    
-           
-    # print('ping mean: ', statistics.mean(delay_array)) # added by swgu
-    # print('ping standard deviation: ', statistics,stdev(delay_array))
-            
+    with open(filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['seq', 'timestamp', 'rtt_ms'])
+        for seq, ts, rtt_ms in rows:
+            writer.writerow([seq, ts, '' if rtt_ms is None else rtt_ms])
+
     print('')
 
 
-class PingQuery(asyncore.dispatcher):
+if asyncore is not None:
+    _Dispatcher = asyncore.dispatcher
+else:
+    class _Dispatcher(object):
+        # Fallback so the module still imports on Python 3.12+ where asyncore
+        # was removed. Using PingQuery/multi_ping_query then fails loudly.
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "PingQuery/multi_ping_query require the 'asyncore' module, "
+                "which was removed in Python 3.12. Use verbose_ping() or "
+                "do_one() instead.")
+
+
+class PingQuery(_Dispatcher):
     def __init__(self, host, p_id, timeout=0.5, ignore_errors=False):
         """
        Derived class from "asyncore.dispatcher" for sending and
@@ -242,7 +368,7 @@ class PingQuery(asyncore.dispatcher):
        will be overwritten with a function which does just nothing.
        
        """
-        asyncore.dispatcher.__init__(self)
+        _Dispatcher.__init__(self)
         try:
             self.create_socket(socket.AF_INET, socket.SOCK_RAW, ICMP_CODE)
         except socket.error as e:
@@ -366,10 +492,13 @@ if __name__ == '__main__':
 #    verbose_ping('an-invalid-test-url.com')
 #    verbose_ping('127.0.0.1')
 #    host_list = ['www.heise.de', 'google.com', '127.0.0.1', 'an-invalid-test-url.com']
-    timeout = input("Please input timeout to wait for ping response (unit: ms) : ")
-    count = input("Please input the number of count to ping : ")
+    dest_addr = input("Please input the IP address (or hostname) to ping : ").strip()
+    timeout = int(input("Please input timeout to wait for ping response (unit: ms) : "))
+    count = int(input("Please input the number of count to ping : "))
+    interval = int(input("Please input interval between pings (unit: ms, 0 = back-to-back, 1000 = like system ping) : "))
 
-    verbose_ping('34.159.104.220', timeout, count)
+    # verbose_ping expects seconds, but the prompts ask for milliseconds.
+    verbose_ping(dest_addr, timeout / 1000.0, count, interval / 1000.0)
     # verbose_ping('34.159.134.245', timeout, count)
     
     

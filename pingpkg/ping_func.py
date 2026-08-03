@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 
 """
     Other Repositories of python-ping
@@ -64,10 +64,10 @@ import socket
 import struct
 import select
 import random
-import asyncore
 
 # From /usr/include/linux/icmp.h; your milage may vary.
 ICMP_ECHO_REQUEST = 8 # Seems to be the same on Solaris.
+ICMP_ECHO_REPLY = 0
 
 ICMP_CODE = socket.getprotobyname('icmp')
 ERROR_DESCR = {
@@ -77,23 +77,23 @@ ERROR_DESCR = {
            ' users or processes with administrator rights.'
     }
 
-__all__ = ['create_packet', 'do_one', 'verbose_ping', 'PingQuery',
-           'multi_ping_query']
+__all__ = ['create_packet', 'do_one', 'verbose_ping', 'multi_ping_query']
 
 
 def checksum(source_string):
     # I'm not too confident that this is right but testing seems to
     # suggest that it gives the same answers as in_cksum in ping.c.
     sum = 0
-    count_to = (len(source_string) / 2) * 2
+    count_to = (len(source_string) // 2) * 2
     count = 0
     while count < count_to:
-        this_val = ord(source_string[count + 1])*256+ord(source_string[count])
+        # source_string is a bytes object, so indexing already yields ints.
+        this_val = source_string[count + 1] * 256 + source_string[count]
         sum = sum + this_val
         sum = sum & 0xffffffff # Necessary?
         count = count + 2
     if count_to < len(source_string):
-        sum = sum + ord(source_string[len(source_string) - 1])
+        sum = sum + source_string[len(source_string) - 1]
         sum = sum & 0xffffffff # Necessary?
     sum = (sum >> 16) + (sum & 0xffff)
     sum = sum + (sum >> 16)
@@ -108,7 +108,7 @@ def create_packet(id):
     """Create a new echo request packet based on the given "id"."""
     # Header is type (8), code (8), checksum (16), id (16), sequence (16)
     header = struct.pack('bbHHh', ICMP_ECHO_REQUEST, 0, 0, id, 1)
-    data = 192 * 'Q'
+    data = 192 * b'Q'
     # Calculate the checksum on the data and the dummy header.
     my_checksum = checksum(header + data)
     # Now that we have the right checksum, we put that in. It's just easier
@@ -116,6 +116,23 @@ def create_packet(id):
     header = struct.pack('bbHHh', ICMP_ECHO_REQUEST, 0,
                          socket.htons(my_checksum), id, 1)
     return header + data
+
+
+def new_icmp_socket():
+    """
+    Return a tuple "(socket, is_raw)" for sending ICMP echo requests.
+
+    Prefers an unprivileged datagram socket (SOCK_DGRAM), which needs no root
+    as long as the caller's gid is within /proc/sys/net/ipv4/ping_group_range.
+    Falls back to a raw socket (SOCK_RAW), which requires root.
+    "is_raw" tells the receiver how to parse replies (see "receive_ping").
+    """
+    try:
+        return socket.socket(socket.AF_INET, socket.SOCK_DGRAM, ICMP_CODE), False
+    except socket.error:
+        # Unprivileged ICMP not available; fall back to a raw socket.
+        my_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, ICMP_CODE)
+        return my_socket, True
 
 
 def do_one(dest_addr, timeout=1):
@@ -126,7 +143,7 @@ def do_one(dest_addr, timeout=1):
     address, respectively.
     """
     try:
-        my_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, ICMP_CODE)
+        my_socket, is_raw = new_icmp_socket()
     except socket.error as e:
         if e.errno in ERROR_DESCR:
             # Operation not permitted
@@ -135,6 +152,7 @@ def do_one(dest_addr, timeout=1):
     try:
         host = socket.gethostbyname(dest_addr)
     except socket.gaierror:
+        my_socket.close()
         return
     # Maximum for an unsigned short int c object counts to 65535 so
     # we have to sure that our packet id is not greater than that.
@@ -143,15 +161,21 @@ def do_one(dest_addr, timeout=1):
     while packet:
         # The icmp protocol does not use a port, but the function
         # below expects it, so we just give it a dummy port.
-        sent = my_socket.sendto(packet, (dest_addr, 1))
+        sent = my_socket.sendto(packet, (host, 1))
         packet = packet[sent:]
-    delay = receive_ping(my_socket, packet_id, time.time(), timeout)
+    delay = receive_ping(my_socket, packet_id, time.time(), timeout, is_raw)
     my_socket.close()
     return delay
 
 
-def receive_ping(my_socket, packet_id, time_sent, timeout):
+def receive_ping(my_socket, packet_id, time_sent, timeout, is_raw=True):
     # Receive the ping from the socket.
+    # A raw socket delivers the full IP packet, so the ICMP header starts at
+    # byte 20 and every icmp reply on the host is delivered (hence we match on
+    # packet_id). A datagram socket delivers just the ICMP message (offset 0)
+    # and the kernel already routed only our reply to us, so any echo reply is
+    # ours (the kernel also rewrites the id, so matching on it is unreliable).
+    offset = 20 if is_raw else 0
     time_left = timeout
     while True:
         started_select = time.time()
@@ -161,10 +185,10 @@ def receive_ping(my_socket, packet_id, time_sent, timeout):
             return
         time_received = time.time()
         rec_packet, addr = my_socket.recvfrom(1024)
-        icmp_header = rec_packet[20:28]
+        icmp_header = rec_packet[offset:offset + 8]
         type, code, checksum, p_id, sequence = struct.unpack(
             'bbHHh', icmp_header)
-        if p_id == packet_id:
+        if (p_id == packet_id) if is_raw else (type == ICMP_ECHO_REPLY):
             return time_received - time_sent
         time_left -= time_received - time_sent
         if time_left <= 0:
@@ -190,141 +214,100 @@ def verbose_ping(dest_addr, timeout=2, count=4):
     print('')
 
 
-class PingQuery(asyncore.dispatcher):
-    def __init__(self, host, p_id, timeout=0.5, ignore_errors=False):
-        """
-       Derived class from "asyncore.dispatcher" for sending and
-       receiving an icmp echo request/reply.
-       
-       Usually this class is used in conjunction with the "loop"
-       function of asyncore.
-       
-       Once the loop is over, you can retrieve the results with
-       the "get_result" method. Assignment is possible through
-       the "get_host" method.
-       
-       "host" represents the address under which the server can be reached.
-       "timeout" is the interval which the host gets granted for its reply.
-       "p_id" must be any unique integer or float except negatives and zeros.
-       
-       If "ignore_errors" is True, the default behaviour of asyncore
-       will be overwritten with a function which does just nothing.
-       
-       """
-        asyncore.dispatcher.__init__(self)
-        try:
-            self.create_socket(socket.AF_INET, socket.SOCK_RAW, ICMP_CODE)
-        except socket.error as e:
-            if e.errno in ERROR_DESCR:
-                # Operation not permitted
-                raise socket.error(''.join((e.args[1], ERROR_DESCR[e.errno])))
-            raise # raise the original error
-        self.time_received = 0
-        self.time_sent = 0
-        self.timeout = timeout
-        # Maximum for an unsigned short int c object counts to 65535 so
-        # we have to sure that our packet id is not greater than that.
-        self.packet_id = int((id(timeout) / p_id) % 65535)
-        self.host = host
-        self.packet = create_packet(self.packet_id)
-        if ignore_errors:
-            # If it does not care whether an error occured or not.
-            self.handle_error = self.do_not_handle_errors
-            self.handle_expt = self.do_not_handle_errors
-
-    def writable(self):
-        return self.time_sent == 0
-
-    def handle_write(self):
-        self.time_sent = time.time()
-        while self.packet:
-            # The icmp protocol does not use a port, but the function
-            # below expects it, so we just give it a dummy port.
-            sent = self.sendto(self.packet, (self.host, 1))
-            self.packet = self.packet[sent:]
-
-    def readable(self):
-        # As long as we did not sent anything, the channel has to be left open.
-        if (not self.writable()
-            # Once we sent something, we should periodically check if the reply
-            # timed out.
-            and self.timeout < (time.time() - self.time_sent)):
-            self.close()
-            return False
-        # If the channel should not be closed, we do not want to read something
-        # until we did not sent anything.
-        return not self.writable()
-
-    def handle_read(self):
-        read_time = time.time()
-        packet, addr = self.recvfrom(1024)
-        header = packet[20:28]
-        type, code, checksum, p_id, sequence = struct.unpack("bbHHh", header)
-        if p_id == self.packet_id:
-            # This comparison is necessary because winsocks do not only get
-            # the replies for their own sent packets.
-            self.time_received = read_time
-            self.close()
-
-    def get_result(self):
-        """Return the ping delay if possible, otherwise None."""
-        if self.time_received > 0:
-            return self.time_received - self.time_sent
-
-    def get_host(self):
-        """Return the host where to the request has or should been sent."""
-        return self.host
-
-    def do_not_handle_errors(self):
-        # Just a dummy handler to stop traceback printing, if desired.
-        pass
-
-    def create_socket(self, family, type, proto):
-        # Overwritten, because the original does not support the "proto" arg.
-        sock = socket.socket(family, type, proto)
-        sock.setblocking(0)
-        self.set_socket(sock)
-        # Part of the original but is not used. (at least at python 2.7)
-        # Copied for possible compatiblity reasons.
-        self.family_and_type = family, type
-
-    # If the following methods would not be there, we would see some very
-    # "useful" warnings from asyncore, maybe. But we do not want to, or do we?
-    def handle_connect(self):
-        pass
-
-    def handle_accept(self):
-        pass
-
-    def handle_close(self):
-        self.close()
-
-
 def multi_ping_query(hosts, timeout=1, step=512, ignore_errors=False):
     """
-    Sends multiple icmp echo requests at once.
+    Sends multiple icmp echo requests at once and collects the replies.
+
     "hosts" is a list of ips or hostnames which should be pinged.
-    "timeout" must be given and a integer or float greater than zero.
-    "step" is the amount of sockets which should be watched at once.
-    See the docstring of "PingQuery" for the meaning of "ignore_erros".
+    "timeout" is the number of seconds to wait for the replies.
+    "step" limits how many sockets are watched by select at once
+    (select supports only a maximum of 512).
+    If "ignore_errors" is True, hosts that cannot be pinged (e.g. because
+    raw sockets are not permitted) are reported as None instead of raising.
+
+    Returns a dict mapping each host to its round-trip delay in seconds,
+    or None on timeout / unresolvable address.
+
+    This is a "select"-based rewrite of the original "asyncore" version,
+    since the asyncore module was removed in Python 3.12.
     """
-    results, host_list, id = {}, [], 0
+    results = {}
+    queue = []          # (host, ip, packet_id) still to be pinged
+    packet_id = 0
     for host in hosts:
         try:
-            host_list.append(socket.gethostbyname(host))
+            ip = socket.gethostbyname(host)
         except socket.gaierror:
             results[host] = None
-    while host_list:
-        sock_list = []
-        for ip in host_list[:step]: # select supports only a max of 512
-            id += 1
-            sock_list.append(PingQuery(ip, id, timeout, ignore_errors))
-            host_list.remove(ip)
-        # Remember to use a timeout here. The risk to get an infinite loop
-        # is high, because noone can guarantee that each host will reply!
-        asyncore.loop(timeout)
-        for sock in sock_list:
-            results[sock.get_host()] = sock.get_result()
+            continue
+        # Keep the packet id within an unsigned short (max 65535).
+        packet_id = (packet_id + 1) % 65535
+        queue.append((host, ip, packet_id))
+        results[host] = None
+
+    # Watch at most "step" sockets per select() call.
+    for start in range(0, len(queue), step):
+        batch = queue[start:start + step]
+        id_to_host = {}     # packet_id -> host (used for raw sockets)
+        sock_to_host = {}   # socket -> host (used for datagram sockets)
+        time_sent = {}      # host -> send timestamp
+        socks = []
+        is_raw = True       # default until a socket is actually created
+        for host, ip, p_id in batch:
+            try:
+                sock, is_raw = new_icmp_socket()
+            except socket.error as e:
+                if ignore_errors:
+                    continue
+                if e.errno in ERROR_DESCR:
+                    # Operation not permitted
+                    raise socket.error(''.join((e.args[1],
+                                                ERROR_DESCR[e.errno])))
+                raise # raise the original error
+            sock.setblocking(False)
+            id_to_host[p_id] = host
+            sock_to_host[sock] = host
+            time_sent[host] = time.time()
+            socks.append(sock)
+            # The icmp protocol does not use a port, but sendto expects one,
+            # so we just give it a dummy port.
+            sock.sendto(create_packet(p_id), (ip, 1))
+
+        # See "receive_ping" for why raw and datagram sockets are matched
+        # differently.
+        offset = 20 if is_raw else 0
+        remaining = len(sock_to_host)
+        end_time = time.time() + timeout
+        while remaining > 0:
+            time_left = end_time - time.time()
+            if time_left <= 0:
+                break
+            ready, _, _ = select.select(socks, [], [], time_left)
+            if not ready:
+                break # timed out
+            recv_time = time.time()
+            for sock in ready:
+                try:
+                    rec_packet, addr = sock.recvfrom(1024)
+                except socket.error:
+                    continue
+                type_, code, chk, r_id, seq = struct.unpack(
+                    'bbHHh', rec_packet[offset:offset + 8])
+                if is_raw:
+                    # A raw socket receives every icmp reply on the host, so
+                    # we match replies to their request by packet id.
+                    host = id_to_host.get(r_id)
+                else:
+                    # The kernel already delivered only our reply to this
+                    # datagram socket, so any echo reply on it is ours.
+                    host = sock_to_host.get(sock)
+                    if type_ != ICMP_ECHO_REPLY:
+                        host = None
+                if host is not None and results[host] is None:
+                    results[host] = recv_time - time_sent[host]
+                    remaining -= 1
+        for sock in socks:
+            sock.close()
     return results
 
 
