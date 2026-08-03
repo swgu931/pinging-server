@@ -48,6 +48,23 @@ Python 3 포팅 및 논문 실험용 RTT 측정 정밀화 작업.
   - `timestamp`: 각 ping 송신 시각(wall-clock, ISO 8601, 마이크로초)
   - `rtt_ms`: 왕복시간(ms), **타임아웃이면 공란** (pandas에서 `NaN`으로 로드 → 손실 구간 보존)
 
+### 상시 지연 모니터링 (`monitor.py`) — 클라우드 로보틱스 운영용
+- 여러 타깃을 주기적으로 프로브하고 Prometheus `/metrics`로 노출하는 상시 프로브 서버 추가.
+  - **ICMP 프로브**(`ping3.do_one` 재사용) + **TCP-connect 프로브**(ICMP 차단 클라우드 대비).
+  - 롤링 윈도 기반 **p50/p95/p99, min/max/mean/stddev, IPDV jitter, 손실률** 계산.
+  - RTT 히스토그램(`probe_rtt_seconds`)으로 Prometheus `histogram_quantile` 집계 지원.
+  - 타깃별 스레드로 동시 프로브, 예외 발생해도 스레드 유지.
+  - 환경변수/CLI 설정: `PROBE_TARGETS`, `PROBE_INTERVAL`, `PROBE_TIMEOUT`, `PROBE_WINDOW`,
+    `METRICS_PORT`.
+- 의존성 추가: `prometheus_client`.
+
+### Docker 구성 (ARM/AMD 멀티 아키텍처)
+- `Dockerfile`(python:3.12-slim, amd64+arm64), `.dockerignore`, `requirements.txt` 추가.
+- `docker-compose.yml`: `probe`(monitor) 서비스 + `monitoring` 프로필의 Prometheus/Grafana.
+- `prometheus.yml`: `probe:9145` 스크레이프 설정.
+- 컨테이너는 root+`NET_RAW` 기본이라 raw ICMP가 바로 동작(호스트 sysctl 불필요).
+- 문서: `docker_readme.md`(빌드/실행/모니터링/PromQL/트러블슈팅).
+
 ### 분석/플롯 (`plot_from_file.py`)
 - 새 CSV(`rtt_ms`) 읽기, 타임아웃 행 자동 제외. 예전 "한 줄에 숫자 하나" 포맷도 자동 폴백.
 - **파일명 입력**: 인자(`python3 plot_from_file.py ping100.csv`) 또는 프롬프트로 지정.

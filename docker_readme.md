@@ -119,7 +119,77 @@ docker run -it --rm -v "$(pwd)/data:/data" pinging-server /app/plot_from_file.py
 
 ---
 
-## 4. 여러 호스트 동시 측정 (`main.py`)
+## 4. 상시 지연 모니터링 (`monitor.py`) — 클라우드 로보틱스 운영용
+
+로봇↔엣지↔클라우드 링크를 **실제 구동과 동시에** 상시 측정하고 Prometheus 메트릭으로
+노출한다. ICMP(네트워크 baseline)와 **TCP-connect**(ICMP가 막힌 클라우드에서 실제 서비스
+포트 도달성) 프로브를 지원하며, p50/p95/p99·jitter·손실률을 계산한다.
+
+### docker run 단독 실행
+
+```bash
+docker run -d --name latency-probe \
+  --cap-add=NET_RAW \
+  -p 9145:9145 \
+  -e PROBE_TARGETS="icmp:10.232.183.148,tcp:api.example.com:443" \
+  -e PROBE_INTERVAL=1.0 \
+  -e PROBE_TIMEOUT=2.0 \
+  -e PROBE_WINDOW=100 \
+  pinging-server /app/monitor.py
+
+curl -s localhost:9145/metrics | grep '^probe_'
+```
+
+### docker compose (권장) — 로봇 스택과 함께 상시 구동
+
+`docker-compose.yml`이 함께 제공된다. `PROBE_TARGETS`만 실제 대상으로 바꾸면 된다.
+
+```bash
+# 프로브만 (경량, :9145/metrics 노출)
+docker compose up -d --build
+
+# 프로브 + Prometheus(:9090) + Grafana(:3000, admin/admin)
+docker compose --profile monitoring up -d --build
+```
+
+로봇/엣지/클라우드의 기존 스택과 **같은 호스트 혹은 같은 compose**에 이 `probe` 서비스를
+추가해 두면, 운영 중 링크 지연을 계속 수집한다.
+
+### 노출되는 주요 메트릭 (`/metrics`)
+
+| 메트릭 | 의미 |
+|---|---|
+| `probe_success{target,proto}` | 마지막 프로브 성공 여부(1/0) |
+| `probe_rtt_seconds{...}` | RTT 히스토그램 (Prometheus `histogram_quantile`용) |
+| `probe_rtt_p50/p95/p99_seconds` | 롤링 윈도 분위수 (서버 없이 바로 읽기용) |
+| `probe_jitter_seconds` | 롤링 IPDV jitter(연속 RTT 차의 평균절대값) |
+| `probe_loss_ratio` | 롤링 손실률 |
+| `probe_total`, `probe_failures_total` | 시도/실패 카운터 |
+
+### PromQL 예시
+
+```promql
+# 5분 p99 (히스토그램 집계)
+histogram_quantile(0.99, sum by (le,target) (rate(probe_rtt_seconds_bucket[5m])))
+
+# 5분 손실률
+rate(probe_failures_total[5m]) / rate(probe_total[5m])
+```
+
+### 설정 (환경변수)
+
+| 변수 | 기본값 | 설명 |
+|---|---|---|
+| `PROBE_TARGETS` | (필수) | `icmp:HOST` / `tcp:HOST:PORT` 쉼표 구분 |
+| `PROBE_INTERVAL` | `1.0` | 타깃별 프로브 간격(초) |
+| `PROBE_TIMEOUT` | `2.0` | 프로브 타임아웃(초) |
+| `PROBE_WINDOW` | `100` | 분위수/jitter/손실률 롤링 윈도 샘플 수 |
+| `METRICS_PORT` | `9145` | `/metrics` 포트 |
+
+> 정확도: compose 기본은 브리지 네트워크(NAT 경유)다. Linux에서 최대 정확도가 필요하면
+> `docker-compose.yml`의 주석대로 `network_mode: host`를 쓴다.
+
+## 5. 여러 호스트 일회성 측정 (`main.py`)
 
 ```bash
 docker run -it --rm --network host pinging-server /app/main.py
@@ -127,12 +197,14 @@ docker run -it --rm --network host pinging-server /app/main.py
 
 ---
 
-## 5. 자주 겪는 문제
+## 6. 자주 겪는 문제
 
 - **`Operation not permitted` (소켓 생성 실패)**: 런타임이 `NET_RAW`를 제거한 경우.
   `--cap-add=NET_RAW`를 추가한다. 그래도 안 되면 `--privileged`(권장하지 않음)로 확인.
 - **CSV/PNG가 호스트에 안 보임**: `-v "$(pwd)/data:/data"` 마운트를 빠뜨렸거나, 파일명에
   경로를 붙여 `/data` 밖에 쓴 경우. 파일명은 경로 없이(`ping100.csv`) 준다.
+- **`/metrics`에 타깃이 안 보임**: `PROBE_TARGETS` 형식 확인(`icmp:HOST` 또는
+  `tcp:HOST:PORT`). Prometheus가 못 긁으면 compose 네트워크에서 `probe:9145` 도달성 확인.
 - **타임스탬프가 UTC로 나옴**: `-e TZ=Asia/Seoul` 지정.
 - **`exec format error`**: 실행 호스트와 다른 아키텍처 이미지를 받은 경우. 멀티아키
   이미지를 push 했는지, 또는 위 QEMU binfmt를 설치했는지 확인.

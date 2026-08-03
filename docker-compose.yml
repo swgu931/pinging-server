@@ -1,0 +1,51 @@
+# Continuous latency monitoring for robot <-> edge <-> cloud links.
+#
+#   docker compose up -d --build            # probe only (exposes :9145/metrics)
+#   docker compose --profile monitoring up -d --build   # + Prometheus + Grafana
+#
+# Run this alongside your robot/edge/cloud stack to measure link latency during
+# actual operation. Point PROBE_TARGETS at the hosts/services you care about.
+services:
+  probe:
+    build: .
+    image: pinging-server
+    command: ["/app/monitor.py"]
+    environment:
+      # icmp:HOST for network baseline; tcp:HOST:PORT for the real service port
+      # (works even when ICMP is blocked by cloud firewalls / security groups).
+      PROBE_TARGETS: "icmp:8.8.8.8,tcp:1.1.1.1:443"
+      PROBE_INTERVAL: "1.0"
+      PROBE_TIMEOUT: "2.0"
+      PROBE_WINDOW: "100"
+      METRICS_PORT: "9145"
+      TZ: "Asia/Seoul"
+    cap_add:
+      - NET_RAW          # needed for ICMP raw-socket fallback
+    ports:
+      - "9145:9145"      # Prometheus /metrics
+    restart: unless-stopped
+    # For the most accurate RTT on Linux (skip the bridge NAT), comment out the
+    # `ports` mapping above and use host networking instead:
+    # network_mode: host
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    depends_on:
+      - probe
+    profiles: ["monitoring"]
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    profiles: ["monitoring"]

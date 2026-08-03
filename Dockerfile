@@ -15,11 +15,16 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 # Application code.
-COPY ping3.py main.py plot_from_file.py /app/
+COPY ping3.py main.py plot_from_file.py monitor.py /app/
 COPY pingpkg/ /app/pingpkg/
 
-# Run headless: matplotlib saves PNGs without a GUI backend.
-ENV MPLBACKEND=Agg
+# Run headless (matplotlib saves PNGs without a GUI) and unbuffered so the
+# monitor's logs show up in `docker logs` immediately.
+ENV MPLBACKEND=Agg \
+    PYTHONUNBUFFERED=1
+
+# Prometheus /metrics port for monitor.py (see docker_readme.md).
+EXPOSE 9145
 
 # Measurement outputs (ping<count>.csv and the *.png plots) are written to the
 # working directory; mount a host directory at /data to keep them.
